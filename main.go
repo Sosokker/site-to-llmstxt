@@ -1,14 +1,15 @@
 package main
 
 import (
+	"bufio"
 	"context"
-	"flag"
 	"fmt"
 	"log"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +20,16 @@ import (
 	"github.com/gocolly/colly/v2"
 	"github.com/gocolly/colly/v2/debug"
 	"github.com/schollz/progressbar/v3"
+	"github.com/urfave/cli/v2"
+)
+
+const (
+	// DefaultWorkers is the default number of concurrent workers
+	DefaultWorkers = 1
+	// DefaultOutputDir is the default output directory
+	DefaultOutputDir = "./output"
+	// MarkdownSubdir is the subdirectory for markdown files
+	MarkdownSubdir = "pages"
 )
 
 // Config holds crawler configuration
@@ -29,18 +40,30 @@ type Config struct {
 	Verbose   bool
 }
 
+// PageInfo represents information about a crawled page
+type PageInfo struct {
+	URL         string
+	Title       string
+	Content     string
+	FilePath    string
+	CrawledAt   time.Time
+	Description string
+}
+
 // Crawler manages the web crawling process
 type Crawler struct {
-	config    *Config
-	collector *colly.Collector
-	converter *converter.Converter
-	visited   map[string]bool
-	queue     chan string
-	wg        sync.WaitGroup
-	mu        sync.RWMutex
-	baseURL   *url.URL
-	bar       *progressbar.ProgressBar
-	processed int
+	config     *Config
+	collector  *colly.Collector
+	converter  *converter.Converter
+	visited    map[string]bool
+	queue      chan string
+	wg         sync.WaitGroup
+	mu         sync.RWMutex
+	baseURL    *url.URL
+	bar        *progressbar.ProgressBar
+	processed  int
+	pages      []PageInfo
+	pagesMutex sync.Mutex
 }
 
 // LanguageFilter contains patterns to exclude language-specific URLs
@@ -67,35 +90,92 @@ var FileExtensionFilter = []string{
 }
 
 func main() {
-	config := parseFlags()
+	app := &cli.App{
+		Name:  "site-to-llmstxt",
+		Usage: "Web crawler that converts websites to LLMs.txt format",
+		Description: `A high-performance web crawler that scrapes websites and converts them to LLMs.txt format.
+		
+The crawler generates:
+- llms.txt: A curated overview following the LLMs.txt specification
+- llms-full.txt: Complete content of all crawled pages
+- pages/: Directory containing individual markdown files
 
+The crawler respects robots.txt, filters out language variants and file downloads,
+and only crawls within the same domain.`,
+		Version: "1.0.0",
+		Authors: []*cli.Author{
+			{
+				Name: "Site-to-LLMsTxt",
+			},
+		},
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:     "url",
+				Aliases:  []string{"u"},
+				Usage:    "Root URL to crawl (required)",
+				Required: true,
+			},
+			&cli.StringFlag{
+				Name:    "output",
+				Aliases: []string{"o"},
+				Usage:   "Output directory",
+				Value:   DefaultOutputDir,
+			},
+			&cli.IntFlag{
+				Name:    "workers",
+				Aliases: []string{"w"},
+				Usage:   "Number of concurrent workers",
+				Value:   DefaultWorkers,
+			},
+			&cli.BoolFlag{
+				Name:  "verbose",
+				Usage: "Enable verbose logging",
+			},
+		},
+		Action: func(c *cli.Context) error {
+			config := &Config{
+				URL:       c.String("url"),
+				OutputDir: c.String("output"),
+				Workers:   c.Int("workers"),
+				Verbose:   c.Bool("verbose"),
+			}
+
+			return runCrawler(config)
+		},
+	}
+
+	if err := app.Run(os.Args); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func runCrawler(config *Config) error {
 	if err := validateConfig(config); err != nil {
-		log.Fatalf("Invalid configuration: %v", err)
+		return fmt.Errorf("invalid configuration: %w", err)
 	}
 
 	crawler, err := NewCrawler(config)
 	if err != nil {
-		log.Fatalf("Failed to create crawler: %v", err)
+		return fmt.Errorf("failed to create crawler: %w", err)
 	}
 
 	ctx := context.Background()
 	if err := crawler.Start(ctx); err != nil {
-		log.Fatalf("Crawling failed: %v", err)
+		return fmt.Errorf("crawling failed: %w", err)
 	}
 
-	fmt.Printf("\nCrawling completed successfully! Files saved to: %s\n", config.OutputDir)
-}
+	if err := crawler.GenerateLLMSFiles(); err != nil {
+		return fmt.Errorf("failed to generate LLMS files: %w", err)
+	}
 
-func parseFlags() *Config {
-	config := &Config{}
+	fmt.Printf("\nCrawling completed successfully!\n")
+	fmt.Printf("Generated files:\n")
+	fmt.Printf("  - %s\n", filepath.Join(config.OutputDir, "llms.txt"))
+	fmt.Printf("  - %s\n", filepath.Join(config.OutputDir, "llms-full.txt"))
+	fmt.Printf("  - %s/ (individual pages)\n", filepath.Join(config.OutputDir, MarkdownSubdir))
+	fmt.Printf("Total pages crawled: %d\n", len(crawler.pages))
 
-	flag.StringVar(&config.URL, "url", "", "Root URL to crawl (required)")
-	flag.StringVar(&config.OutputDir, "output", "./output", "Output directory for markdown files")
-	flag.IntVar(&config.Workers, "workers", 5, "Number of concurrent workers")
-	flag.BoolVar(&config.Verbose, "verbose", false, "Enable verbose logging")
-	flag.Parse()
-
-	return config
+	return nil
 }
 
 func validateConfig(config *Config) error {
@@ -103,14 +183,13 @@ func validateConfig(config *Config) error {
 		return fmt.Errorf("URL is required")
 	}
 
-	parsedURL, err := url.Parse(config.URL)
+	u, err := url.Parse(config.URL)
 	if err != nil {
 		return fmt.Errorf("invalid URL: %w", err)
 	}
 
-	// Check if URL has a valid scheme and host
-	if parsedURL.Scheme == "" || parsedURL.Host == "" {
-		return fmt.Errorf("URL must include scheme (http/https) and host")
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("URL must have http or https scheme")
 	}
 
 	if config.Workers <= 0 {
@@ -127,9 +206,9 @@ func NewCrawler(config *Config) (*Crawler, error) {
 		return nil, fmt.Errorf("failed to parse base URL: %w", err)
 	}
 
-	// Create output directory
-	if err := os.MkdirAll(config.OutputDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create output directory: %w", err)
+	// Create output directory structure
+	if err := createOutputDirs(config.OutputDir); err != nil {
+		return nil, fmt.Errorf("failed to create output directories: %w", err)
 	}
 
 	// Setup colly collector
@@ -145,7 +224,7 @@ func NewCrawler(config *Config) (*Crawler, error) {
 	c.Limit(&colly.LimitRule{
 		DomainGlob:  "*",
 		Parallelism: config.Workers,
-		Delay:       100 * time.Millisecond,
+		Delay:       200 * time.Millisecond, // Slightly more conservative
 	})
 
 	// Setup HTML to Markdown converter
@@ -164,11 +243,27 @@ func NewCrawler(config *Config) (*Crawler, error) {
 		queue:     make(chan string, 1000),
 		baseURL:   baseURL,
 		bar:       progressbar.NewOptions(-1, progressbar.OptionSetDescription("Crawling pages")),
+		pages:     make([]PageInfo, 0),
 	}
 
 	crawler.setupCallbacks()
 
 	return crawler, nil
+}
+
+func createOutputDirs(outputDir string) error {
+	dirs := []string{
+		outputDir,
+		filepath.Join(outputDir, MarkdownSubdir),
+	}
+
+	for _, dir := range dirs {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("failed to create directory %s: %w", dir, err)
+		}
+	}
+
+	return nil
 }
 
 func (c *Crawler) setupCallbacks() {
@@ -199,9 +294,16 @@ func (c *Crawler) setupCallbacks() {
 
 func (c *Crawler) processPage(e *colly.HTMLElement) {
 	// Get page title
-	title := e.ChildText("title")
+	title := strings.TrimSpace(e.ChildText("title"))
 	if title == "" {
-		title = "untitled"
+		title = "Untitled"
+	}
+
+	// Get meta description
+	description := strings.TrimSpace(e.ChildAttr("meta[name='description']", "content"))
+	if description == "" {
+		// Try og:description
+		description = strings.TrimSpace(e.ChildAttr("meta[property='og:description']", "content"))
 	}
 
 	// Convert HTML to Markdown
@@ -217,31 +319,62 @@ func (c *Crawler) processPage(e *colly.HTMLElement) {
 		return
 	}
 
-	// Save to file
-	if err := c.saveMarkdown(e.Request.URL, title, markdown); err != nil {
+	// Create page info
+	pageInfo := PageInfo{
+		URL:         e.Request.URL.String(),
+		Title:       title,
+		Content:     markdown,
+		CrawledAt:   time.Now(),
+		Description: description,
+	}
+
+	// Save individual markdown file
+	filename := c.createFilename(e.Request.URL, title)
+	pageInfo.FilePath = filepath.Join(MarkdownSubdir, filename)
+	fullPath := filepath.Join(c.config.OutputDir, pageInfo.FilePath)
+
+	if err := c.saveMarkdown(fullPath, pageInfo); err != nil {
 		log.Printf("Failed to save markdown for %s: %v", e.Request.URL, err)
 		return
 	}
+
+	// Add to pages collection
+	c.pagesMutex.Lock()
+	c.pages = append(c.pages, pageInfo)
+	c.pagesMutex.Unlock()
 
 	c.mu.Lock()
 	c.processed++
 	c.mu.Unlock()
 }
 
-func (c *Crawler) saveMarkdown(pageURL *url.URL, title, markdown string) error {
-	// Create filename from URL path
-	filename := c.createFilename(pageURL, title)
-	filePath := filepath.Join(c.config.OutputDir, filename)
-
+func (c *Crawler) saveMarkdown(filePath string, pageInfo PageInfo) error {
 	// Ensure directory exists
 	dir := filepath.Dir(filePath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
 
-	// Add metadata header
-	content := fmt.Sprintf("# %s\n\nURL: %s\nCrawled: %s\n\n---\n\n%s",
-		title, pageURL.String(), time.Now().Format(time.RFC3339), markdown)
+	// Create content with metadata
+	content := fmt.Sprintf(`# %s
+
+URL: %s
+Crawled: %s
+%s
+
+---
+
+%s`,
+		pageInfo.Title,
+		pageInfo.URL,
+		pageInfo.CrawledAt.Format(time.RFC3339),
+		func() string {
+			if pageInfo.Description != "" {
+				return fmt.Sprintf("Description: %s", pageInfo.Description)
+			}
+			return ""
+		}(),
+		pageInfo.Content)
 
 	// Write file
 	if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
@@ -265,6 +398,11 @@ func (c *Crawler) createFilename(pageURL *url.URL, title string) string {
 			urlPath = "index"
 		}
 		filename = strings.ReplaceAll(urlPath, "/", "-")
+	}
+
+	// Limit filename length
+	if len(filename) > 100 {
+		filename = filename[:100]
 	}
 
 	// Ensure .md extension
@@ -329,7 +467,7 @@ func (c *Crawler) shouldSkipURL(urlStr string) bool {
 		}
 	}
 
-	// Skip fragments and query parameters that might be irrelevant
+	// Skip fragments
 	if strings.Contains(urlStr, "#") {
 		return true
 	}
@@ -342,6 +480,10 @@ func (c *Crawler) Start(ctx context.Context) error {
 	fmt.Printf("Output directory: %s\n", c.config.OutputDir)
 	fmt.Printf("Workers: %d\n", c.config.Workers)
 
+	// Create a cancellable context for workers
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	// Add seed URL to queue
 	c.queue <- c.config.URL
 	c.visited[c.config.URL] = true
@@ -349,13 +491,25 @@ func (c *Crawler) Start(ctx context.Context) error {
 	// Start workers
 	for i := 0; i < c.config.Workers; i++ {
 		c.wg.Add(1)
-		go c.worker(ctx)
+		go c.worker(workerCtx)
 	}
 
-	// Monitor progress
-	go c.monitor(ctx)
+	// Monitor progress and handle completion
+	done := make(chan struct{})
+	go func() {
+		c.monitor(workerCtx)
+		close(done)
+	}()
 
-	// Wait for completion
+	// Wait for either completion or cancellation
+	select {
+	case <-done:
+		cancel() // Stop workers
+	case <-ctx.Done():
+		// External cancellation
+	}
+
+	// Wait for workers to finish
 	c.wg.Wait()
 	close(c.queue)
 	c.bar.Finish()
@@ -386,7 +540,7 @@ func (c *Crawler) worker(ctx context.Context) {
 }
 
 func (c *Crawler) monitor(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(2 * time.Second) // Check more frequently
 	defer ticker.Stop()
 
 	lastProcessed := 0
@@ -404,8 +558,12 @@ func (c *Crawler) monitor(ctx context.Context) {
 
 			if current == lastProcessed {
 				noProgressCount++
-				if noProgressCount >= 6 && queueLen == 0 { // 30 seconds with no progress and empty queue
-					fmt.Println("\nNo progress detected, stopping crawler...")
+				// More aggressive completion detection
+				if (noProgressCount >= 3 && queueLen == 0) || // 6 seconds with no progress and empty queue
+					(noProgressCount >= 15) { // Or 30 seconds regardless
+					if c.config.Verbose {
+						fmt.Println("\nNo progress detected, stopping crawler...")
+					}
 					return
 				}
 			} else {
@@ -418,4 +576,225 @@ func (c *Crawler) monitor(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// GenerateLLMSFiles creates both llms.txt and llms-full.txt files
+func (c *Crawler) GenerateLLMSFiles() error {
+	if err := c.generateLLMSTxt(); err != nil {
+		return fmt.Errorf("failed to generate llms.txt: %w", err)
+	}
+
+	if err := c.generateLLMSFullTxt(); err != nil {
+		return fmt.Errorf("failed to generate llms-full.txt: %w", err)
+	}
+
+	return nil
+}
+
+func (c *Crawler) generateLLMSTxt() error {
+	// Sort pages by URL for consistent output
+	sortedPages := make([]PageInfo, len(c.pages))
+	copy(sortedPages, c.pages)
+	sort.Slice(sortedPages, func(i, j int) bool {
+		return sortedPages[i].URL < sortedPages[j].URL
+	})
+
+	var content strings.Builder
+
+	// H1 title (required)
+	siteTitle := c.getSiteTitle()
+	content.WriteString(fmt.Sprintf("# %s\n\n", siteTitle))
+
+	// Blockquote summary (optional but recommended)
+	summary := c.generateSiteSummary()
+	if summary != "" {
+		content.WriteString(fmt.Sprintf("> %s\n\n", summary))
+	}
+
+	// Additional details
+	content.WriteString(fmt.Sprintf("This documentation was automatically crawled from %s on %s.\n\n",
+		c.config.URL, time.Now().Format("January 2, 2006")))
+
+	// Main documentation section
+	content.WriteString("## Documentation\n\n")
+	for _, page := range sortedPages {
+		if c.isMainDocPage(page) {
+			description := page.Description
+			if description == "" {
+				description = c.extractFirstSentence(page.Content)
+			}
+			if description != "" {
+				content.WriteString(fmt.Sprintf("- [%s](%s): %s\n", page.Title, page.URL, description))
+			} else {
+				content.WriteString(fmt.Sprintf("- [%s](%s)\n", page.Title, page.URL))
+			}
+		}
+	}
+
+	// Optional section for secondary pages
+	secondaryPages := c.getSecondaryPages(sortedPages)
+	if len(secondaryPages) > 0 {
+		content.WriteString("\n## Optional\n\n")
+		for _, page := range secondaryPages {
+			content.WriteString(fmt.Sprintf("- [%s](%s)\n", page.Title, page.URL))
+		}
+	}
+
+	// Write to file
+	filePath := filepath.Join(c.config.OutputDir, "llms.txt")
+	return os.WriteFile(filePath, []byte(content.String()), 0644)
+}
+
+func (c *Crawler) generateLLMSFullTxt() error {
+	// Sort pages by URL for consistent output
+	sortedPages := make([]PageInfo, len(c.pages))
+	copy(sortedPages, c.pages)
+	sort.Slice(sortedPages, func(i, j int) bool {
+		return sortedPages[i].URL < sortedPages[j].URL
+	})
+
+	var content strings.Builder
+
+	// H1 title
+	siteTitle := c.getSiteTitle()
+	content.WriteString(fmt.Sprintf("# %s - Complete Documentation\n\n", siteTitle))
+
+	// Summary
+	summary := c.generateSiteSummary()
+	if summary != "" {
+		content.WriteString(fmt.Sprintf("> %s\n\n", summary))
+	}
+
+	content.WriteString(fmt.Sprintf("This file contains the complete content of all pages crawled from %s on %s.\n\n",
+		c.config.URL, time.Now().Format("January 2, 2006")))
+
+	content.WriteString("---\n\n")
+
+	// Include full content of each page
+	for i, page := range sortedPages {
+		content.WriteString(fmt.Sprintf("## %s\n\n", page.Title))
+		content.WriteString(fmt.Sprintf("**URL:** %s\n\n", page.URL))
+
+		if page.Description != "" {
+			content.WriteString(fmt.Sprintf("**Description:** %s\n\n", page.Description))
+		}
+
+		content.WriteString(fmt.Sprintf("**Crawled:** %s\n\n", page.CrawledAt.Format(time.RFC3339)))
+
+		// Clean and include content
+		cleanContent := c.cleanContentForLLMS(page.Content)
+		content.WriteString(cleanContent)
+
+		// Add separator between pages (except for the last one)
+		if i < len(sortedPages)-1 {
+			content.WriteString("\n\n---\n\n")
+		}
+	}
+
+	// Write to file
+	filePath := filepath.Join(c.config.OutputDir, "llms-full.txt")
+	return os.WriteFile(filePath, []byte(content.String()), 0644)
+}
+
+func (c *Crawler) getSiteTitle() string {
+	// Try to get site title from the main page
+	for _, page := range c.pages {
+		if page.URL == c.config.URL || page.URL == c.config.URL+"/" {
+			if page.Title != "" && page.Title != "Untitled" {
+				return page.Title
+			}
+		}
+	}
+
+	// Fallback to domain name
+	return c.baseURL.Host
+}
+
+func (c *Crawler) generateSiteSummary() string {
+	// Try to get description from the main page
+	for _, page := range c.pages {
+		if page.URL == c.config.URL || page.URL == c.config.URL+"/" {
+			if page.Description != "" {
+				return page.Description
+			}
+			// Extract first meaningful paragraph
+			return c.extractFirstSentence(page.Content)
+		}
+	}
+
+	return fmt.Sprintf("Documentation and content from %s", c.baseURL.Host)
+}
+
+func (c *Crawler) isMainDocPage(page PageInfo) bool {
+	// Consider a page "main documentation" if it's not in typical secondary sections
+	lowerURL := strings.ToLower(page.URL)
+
+	// Skip pages that are typically secondary
+	secondaryIndicators := []string{
+		"/blog", "/news", "/archive", "/changelog", "/release",
+		"/about", "/contact", "/legal", "/privacy", "/terms",
+		"/community", "/forum", "/discuss",
+	}
+
+	for _, indicator := range secondaryIndicators {
+		// Check for the indicator followed by either / or end of URL
+		if strings.Contains(lowerURL, indicator+"/") || strings.HasSuffix(lowerURL, indicator) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (c *Crawler) getSecondaryPages(allPages []PageInfo) []PageInfo {
+	var secondary []PageInfo
+	for _, page := range allPages {
+		if !c.isMainDocPage(page) {
+			secondary = append(secondary, page)
+		}
+	}
+	return secondary
+}
+
+func (c *Crawler) extractFirstSentence(content string) string {
+	// Clean the content and extract the first meaningful sentence
+	lines := strings.Split(content, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		// Skip empty lines, headers, and markdown syntax
+		if len(line) > 50 && !strings.HasPrefix(line, "#") && !strings.HasPrefix(line, "**") {
+			// Find the first sentence
+			sentences := strings.Split(line, ".")
+			if len(sentences) > 0 && len(sentences[0]) > 20 {
+				return strings.TrimSpace(sentences[0]) + "."
+			}
+		}
+	}
+	return ""
+}
+
+func (c *Crawler) cleanContentForLLMS(content string) string {
+	// Clean the content for better readability in LLMs context
+	var cleaned strings.Builder
+	scanner := bufio.NewScanner(strings.NewReader(content))
+
+	var inCodeBlock bool
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// Handle code blocks
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+			inCodeBlock = !inCodeBlock
+		}
+
+		// Skip empty lines unless in code block
+		if strings.TrimSpace(line) == "" && !inCodeBlock {
+			continue
+		}
+
+		cleaned.WriteString(line)
+		cleaned.WriteString("\n")
+	}
+
+	return strings.TrimSpace(cleaned.String())
 }
