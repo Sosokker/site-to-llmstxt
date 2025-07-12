@@ -8,6 +8,16 @@
 *.so
 *.dylib
 
+# Project binaries
+crawler
+site-to-llmstxt
+
+# Output directories
+output/
+test-output/
+example-output/
+crawled-docs/
+
 # Test binary, built with `go test -c`
 *.test
 
@@ -16,6 +26,24 @@
 coverage.*
 *.coverprofile
 profile.cov
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
