@@ -27,6 +27,15 @@ cd site-to-llmstxt
 make build
 ```
 
+
+Or with Makefile
+
+```bash
+make build
+make run URL=https://example.com
+make run URL=https://httpbin.org WORKERS=2 OUTPUT=./test-output
+```
+
 ---
 
 ## Quick Start
