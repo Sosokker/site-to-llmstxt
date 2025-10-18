@@ -7,55 +7,77 @@ func TestShouldSkipURL(t *testing.T) {
 		name     string
 		url      string
 		baseHost string
+		basePath string
 		want     bool
 	}{
 		{
 			name:     "Normal URL",
 			url:      "https://example.com/docs",
 			baseHost: "example.com",
+			basePath: "",
 			want:     false,
 		},
 		{
 			name:     "Language URL - en",
 			url:      "https://example.com/en/docs",
 			baseHost: "example.com",
+			basePath: "",
 			want:     true,
 		},
 		{
 			name:     "Language URL - zh",
 			url:      "https://example.com/zh/docs",
 			baseHost: "example.com",
+			basePath: "",
 			want:     true,
 		},
 		{
 			name:     "PDF file",
 			url:      "https://example.com/doc.pdf",
 			baseHost: "example.com",
+			basePath: "",
 			want:     true,
 		},
 		{
 			name:     "ZIP file",
 			url:      "https://example.com/download.zip",
 			baseHost: "example.com",
+			basePath: "",
 			want:     true,
 		},
 		{
 			name:     "Fragment URL",
 			url:      "https://example.com/docs#section",
 			baseHost: "example.com",
+			basePath: "",
 			want:     true,
 		},
 		{
 			name:     "External domain",
 			url:      "https://other.com/docs",
 			baseHost: "example.com",
+			basePath: "",
 			want:     true,
+		},
+		{
+			name:     "Language URL outside base path",
+			url:      "https://example.com/en/reference",
+			baseHost: "example.com",
+			basePath: "/en/docs/",
+			want:     true,
+		},
+		{
+			name:     "Sub path inside base",
+			url:      "https://example.com/en/docs/liff/guide",
+			baseHost: "example.com",
+			basePath: "/en/docs/liff/",
+			want:     false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := ShouldSkipURL(tt.url, tt.baseHost); got != tt.want {
+			if got := ShouldSkipURL(tt.url, tt.baseHost, tt.basePath); got != tt.want {
 				t.Errorf("ShouldSkipURL() = %v, want %v", got, tt.want)
 			}
 		})

@@ -9,8 +9,11 @@
 *.dylib
 
 # Project binaries
-crawler
-site-to-llmstxt
+/crawler
+/site-to-llmstxt
+.gocache/
+.gomodcache/
+main
 
 # Output directories
 output/
@@ -58,3 +61,5 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+bin/

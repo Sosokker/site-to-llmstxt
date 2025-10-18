@@ -1,6 +1,6 @@
 # Makefile for site-to-llmstxt crawler
 
-.PHONY: build test clean run help fmt lint deps dev-setup
+.PHONY: build test clean run tui demo help fmt lint deps dev-setup all
 
 # Variables
 BINARY_NAME=site-to-llmstxt
@@ -15,6 +15,7 @@ help:
 	@echo "  test-coverage - Run tests with coverage"
 	@echo "  clean         - Clean build artifacts"
 	@echo "  run           - Run with example URL (requires URL variable)"
+	@echo "  tui           - Launch interactive terminal UI"
 	@echo "  fmt           - Format code"
 	@echo "  lint          - Lint code"
 	@echo "  deps          - Install/update dependencies"
@@ -24,6 +25,7 @@ help:
 	@echo "  make build"
 	@echo "  make run URL=https://example.com"
 	@echo "  make run URL=https://httpbin.org WORKERS=2 OUTPUT=./test-output"
+	@echo "  make tui OUTPUT=./docs WORKERS=4"
 
 # Build the crawler
 build:
@@ -98,3 +100,7 @@ all: clean deps fmt build test
 demo: build
 	@echo "Running demo crawl of httpbin.org..."
 	$(BUILD_DIR)/$(BINARY_NAME) --url https://httpbin.org --output ./demo-output --workers 1 --verbose
+# Launch interactive TUI
+tui:
+	@echo "Launching TUI..."
+	go run ./cmd/site-to-llmstxt tui $(if $(OUTPUT),--output $(OUTPUT)) $(if $(WORKERS),--workers $(WORKERS))

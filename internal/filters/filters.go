@@ -31,7 +31,7 @@ var SecondaryPageIndicators = []string{
 }
 
 // ShouldSkipURL determines if a URL should be skipped based on various filters.
-func ShouldSkipURL(rawURL, baseHost string) bool {
+func ShouldSkipURL(rawURL, baseHost, basePath string) bool {
 	if rawURL == "" {
 		return true
 	}
@@ -53,10 +53,26 @@ func ShouldSkipURL(rawURL, baseHost string) bool {
 	}
 
 	lowerURL := strings.ToLower(rawURL)
+	basePathLower := strings.ToLower(basePath)
+	if basePathLower != "" && !strings.HasPrefix(basePathLower, "/") {
+		basePathLower = "/" + basePathLower
+	}
+	basePathLower = strings.TrimRight(basePathLower, "/")
+
+	candidatePath := strings.ToLower(u.Path)
+	baseClean := strings.TrimSuffix(basePathLower, "/")
+	if baseClean != "" && baseClean != "/" {
+		if candidatePath != baseClean && !strings.HasPrefix(candidatePath, baseClean+"/") {
+			return true
+		}
+	}
 
 	// Skip language variants
 	for _, lang := range LanguageIndicators {
 		if strings.Contains(lowerURL, lang) {
+			if basePathLower != "" && strings.Contains(basePathLower, lang) {
+				continue
+			}
 			return true
 		}
 	}
